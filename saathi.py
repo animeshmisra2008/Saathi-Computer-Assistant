@@ -17,6 +17,7 @@ import tkinter as tk
 
 import sounddevice as sd
 from PIL import ImageGrab
+from pywinauto import Desktop
 from sarvamai import SarvamAI
 
 
@@ -1000,11 +1001,66 @@ class SaathiApp(tk.Tk):
         result["step_done"] = bool(result.get("step_done"))
         result["task_done"] = bool(result.get("task_done"))
         if result["target_box"] and result["target_label"]:
-            located_box = self._locate_visible_control(
-                current_image, image_size, result["target_label"])
+            accessible_bounds = self._locate_accessible_control(result["target_label"])
+            if accessible_bounds:
+                screen_width = max(1, user32.GetSystemMetrics(0))
+                screen_height = max(1, user32.GetSystemMetrics(1))
+                located_box = [
+                    round(accessible_bounds[0] * 1000 / screen_width),
+                    round(accessible_bounds[1] * 1000 / screen_height),
+                    round(accessible_bounds[2] * 1000 / screen_width),
+                    round(accessible_bounds[3] * 1000 / screen_height),
+                ]
+            else:
+                located_box = self._locate_visible_control(
+                    current_image, image_size, result["target_label"])
             # A wrong arrow is more confusing than a spoken instruction alone.
             result["target_box"] = located_box
         return result
+
+    @staticmethod
+    def _locate_accessible_control(target_label):
+        target = "".join(character for character in target_label.casefold()
+                         if character.isalnum())
+        if not target:
+            return None
+        candidates = []
+        clickable_types = {
+            "Button", "MenuItem", "Hyperlink", "TabItem", "ListItem",
+            "TreeItem", "CheckBox", "RadioButton", "SplitButton",
+        }
+        try:
+            for window in Desktop(backend="uia").windows():
+                try:
+                    elements = window.descendants()
+                except Exception:
+                    continue
+                for element in elements:
+                    try:
+                        if element.element_info.control_type not in clickable_types:
+                            continue
+                        name = element.window_text().strip()
+                        normalized = "".join(character for character in name.casefold()
+                                             if character.isalnum())
+                        if not normalized or not (normalized == target or
+                                                  target in normalized or normalized in target):
+                            continue
+                        if not element.is_visible() or not element.is_enabled():
+                            continue
+                        rect = element.rectangle()
+                        if rect.right <= rect.left or rect.bottom <= rect.top:
+                            continue
+                        exact_rank = 0 if normalized == target else 1
+                        candidates.append((exact_rank, abs(len(normalized) - len(target)),
+                                           rect.left, rect.top, rect.right, rect.bottom))
+                    except Exception:
+                        continue
+        except Exception:
+            return None
+        if not candidates:
+            return None
+        candidate = min(candidates)
+        return candidate[2], candidate[3], candidate[4], candidate[5]
 
     def _locate_visible_control(self, image_data, image_size, target_label):
         prompt = (
