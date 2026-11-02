@@ -104,6 +104,14 @@ user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
 user32.GetCursorPos.restype = wintypes.BOOL
 user32.SetLayeredWindowAttributes.argtypes = [wintypes.HWND, wintypes.DWORD, wintypes.BYTE, wintypes.DWORD]
 user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
+user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetAncestor.restype = wintypes.HWND
+user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT,
+                                   wintypes.WPARAM, wintypes.LPARAM]
+user32.CallWindowProcW.restype = ctypes.c_ssize_t
+user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, wintypes.UINT]
+user32.SetWindowPos.restype = wintypes.BOOL
 
 SYSTEM_PROMPT = """You are Saathi, a patient guide for people who are new to Windows 11.
 Explain the requested computer task as 3 to 7 small, safe steps in the selected language.
@@ -185,6 +193,9 @@ class SaathiApp(tk.Tk):
         self.screen_message = ""
         self.screen_highlight_bounds = None
         self.overlay = None
+        self.overlay_hwnd = None
+        self.overlay_original_wndproc = None
+        self.overlay_wndproc_callback = None
         self.window_options = {}
         self.window_choice_var = None
 
@@ -1149,7 +1160,10 @@ class SaathiApp(tk.Tk):
             self.overlay_canvas = tk.Canvas(self.overlay, bg="#FF00FF", highlightthickness=0)
             self.overlay_canvas.pack(fill="both", expand=True)
             self.overlay.update_idletasks()
-            hwnd = self.overlay.winfo_id()
+            hwnd = user32.GetAncestor(wintypes.HWND(self.overlay.winfo_id()), 2)
+            if not hwnd:
+                hwnd = wintypes.HWND(self.overlay.winfo_id())
+            self.overlay_hwnd = hwnd
             get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
             set_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
             get_long.argtypes = [wintypes.HWND, ctypes.c_int]
@@ -1159,6 +1173,25 @@ class SaathiApp(tk.Tk):
             style = get_long(hwnd, -20)
             set_long(hwnd, -20, style | 0x00080000 | 0x00000020 | 0x00000080 | 0x08000000)
             user32.SetLayeredWindowAttributes(hwnd, 0x00FF00FF, 0, 0x00000001)
+            self.overlay_original_wndproc = get_long(hwnd, -4)
+            wndproc_type = ctypes.WINFUNCTYPE(
+                ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT,
+                wintypes.WPARAM, wintypes.LPARAM)
+
+            def click_through_wndproc(window, message, wparam, lparam):
+                if message == 0x0084:  # WM_NCHITTEST
+                    return -1  # HTTRANSPARENT
+                if message == 0x0021:  # WM_MOUSEACTIVATE
+                    return 3  # MA_NOACTIVATE
+                return user32.CallWindowProcW(
+                    ctypes.c_void_p(self.overlay_original_wndproc),
+                    window, message, wparam, lparam)
+
+            self.overlay_wndproc_callback = wndproc_type(click_through_wndproc)
+            set_long(hwnd, -4, ctypes.cast(self.overlay_wndproc_callback,
+                                           ctypes.c_void_p).value)
+            user32.SetWindowPos(hwnd, None, 0, 0, 0, 0,
+                                0x0001 | 0x0002 | 0x0004 | 0x0020)
         margin = 30
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
