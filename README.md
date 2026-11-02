@@ -9,7 +9,7 @@ Saathi is a voice-first Windows guide for older adults and people who are new to
 
 - **Voice Assistance:** Speak a request and hear each instruction aloud.
 - **Step-by-Step Guidance:** Breaks everyday Windows tasks into one action at a time, with a clear highlighted step.
-- **Screen Guidance:** Select an open app window and Saathi highlights the next button on screen. After each click, it checks the updated window and guides the next action.
+- **Screen Guidance:** Choose an app to start with. Saathi can guide across the visible desktop, apps, and taskbar, highlighting the next button and checking the screen after each click.
 - **Type Instead:** Hold the edge launcher to type a request.
 - **Language Choice:** Guidance is available in English, Hindi, Bengali, Tamil, Telugu, Kannada, Malayalam, Marathi, Gujarati, Punjabi, and Odia.
 
