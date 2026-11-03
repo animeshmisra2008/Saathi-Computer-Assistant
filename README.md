@@ -1,7 +1,6 @@
 # Saathi — Windows help, one simple step at a time
 
-**Author:** [Add your name(s)]  
-**GitHub:** https://github.com/animeshmisra2008/Sarvam-AI-Project
+**Author:** Animesh Misra
 
 ## What It Does
 

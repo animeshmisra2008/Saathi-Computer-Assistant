@@ -1011,8 +1011,12 @@ class SaathiApp(tk.Tk):
         result["target_label"] = str(result.get("target_label") or "").strip()
         result["step_done"] = bool(result.get("step_done"))
         result["task_done"] = bool(result.get("task_done"))
+        direct_target = self._youtube_navigation_target(image_size)
+        if direct_target:
+            result.update(direct_target)
         if result["target_box"] and result["target_label"]:
-            accessible_bounds = self._locate_accessible_control(result["target_label"])
+            accessible_bounds = self._locate_accessible_control(
+                result["target_label"], expected_box=result["target_box"])
             if accessible_bounds:
                 screen_width = max(1, user32.GetSystemMetrics(0))
                 screen_height = max(1, user32.GetSystemMetrics(1))
@@ -1023,19 +1027,101 @@ class SaathiApp(tk.Tk):
                     round(accessible_bounds[3] * 1000 / screen_height),
                 ]
             else:
-                located_box = self._locate_visible_control(
-                    current_image, image_size, result["target_label"])
-            # A wrong arrow is more confusing than a spoken instruction alone.
+                located_box = None
+            # Only draw an arrow when Windows confirms the named control.
+            # A second visual guess can confidently point at a different item.
             result["target_box"] = located_box
         return result
 
+    def _youtube_navigation_target(self, image_size):
+        """Use Firefox's actual accessible controls for the common YouTube task."""
+        goal = (self.task or "").casefold()
+        title = (self._window_title(self.guided_hwnd) or "").casefold()
+        if "youtube" not in goal or "firefox" not in goal or "firefox" not in title:
+            return None
+
+        screen_width = max(1, user32.GetSystemMetrics(0))
+        screen_height = max(1, user32.GetSystemMetrics(1))
+
+        def normalized_box(rect):
+            return [
+                round(max(0, min(screen_width, rect.left)) * 1000 / screen_width),
+                round(max(0, min(screen_height, rect.top)) * 1000 / screen_height),
+                round(max(0, min(screen_width, rect.right)) * 1000 / screen_width),
+                round(max(0, min(screen_height, rect.bottom)) * 1000 / screen_height),
+            ]
+
+        try:
+            windows = Desktop(backend="uia").windows()
+            firefox = next((window for window in windows
+                            if int(window.handle) == int(self.guided_hwnd)), None)
+            taskbar = next((window for window in windows
+                            if window.window_text().strip().casefold() == "taskbar"), None)
+            foreground_pid = self._window_process_id(user32.GetForegroundWindow())
+
+            # If Start or another app is covering Firefox, use its real taskbar
+            # button first. This avoids highlighting a control underneath a menu.
+            if foreground_pid != self.guided_process_id and taskbar:
+                for element in taskbar.descendants(control_type="Button"):
+                    name = element.window_text().strip()
+                    if name.casefold().startswith("firefox") and "running window" in name.casefold():
+                        rect = element.rectangle()
+                        return {
+                            "instruction": "Click Firefox on the taskbar to bring it to the front.",
+                            "target_label": name,
+                            "target_box": normalized_box(rect),
+                            "step_done": False,
+                            "task_done": False,
+                        }
+
+            if not firefox:
+                return None
+            if "youtube" in self._window_title(self.guided_hwnd).casefold():
+                return {
+                    "instruction": "YouTube is open in Firefox.",
+                    "target_label": "",
+                    "target_box": None,
+                    "step_done": True,
+                    "task_done": True,
+                }
+            controls = firefox.descendants()
+            for element in controls:
+                if (element.element_info.control_type == "Hyperlink"
+                        and "youtube" in element.window_text().casefold()
+                        and element.is_visible() and element.is_enabled()):
+                    return {
+                        "instruction": "Click the YouTube shortcut on Firefox's new tab page.",
+                        "target_label": element.window_text().strip(),
+                        "target_box": normalized_box(element.rectangle()),
+                        "step_done": False,
+                        "task_done": False,
+                    }
+            for element in controls:
+                if (element.element_info.control_type == "Button"
+                        and "search with google or enter address" in element.window_text().casefold()
+                        and element.is_visible() and element.is_enabled()):
+                    return {
+                        "instruction": "Click Firefox's address bar, type youtube.com, then press Enter.",
+                        "target_label": element.window_text().strip(),
+                        "target_box": normalized_box(element.rectangle()),
+                        "step_done": False,
+                        "task_done": False,
+                    }
+        except Exception:
+            return None
+        return None
+
     @staticmethod
-    def _locate_accessible_control(target_label):
+    def _locate_accessible_control(target_label, expected_box=None):
         target = "".join(character for character in target_label.casefold()
                          if character.isalnum())
         if not target:
             return None
         candidates = []
+        expected_center = None
+        if expected_box:
+            expected_center = ((expected_box[0] + expected_box[2]) / 2000,
+                               (expected_box[1] + expected_box[3]) / 2000)
         clickable_types = {
             "Button", "MenuItem", "Hyperlink", "TabItem", "ListItem",
             "TreeItem", "CheckBox", "RadioButton", "SplitButton",
@@ -1053,8 +1139,7 @@ class SaathiApp(tk.Tk):
                         name = element.window_text().strip()
                         normalized = "".join(character for character in name.casefold()
                                              if character.isalnum())
-                        if not normalized or not (normalized == target or
-                                                  target in normalized or normalized in target):
+                        if not normalized or not (normalized == target or target in normalized):
                             continue
                         if not element.is_visible() or not element.is_enabled():
                             continue
@@ -1062,7 +1147,16 @@ class SaathiApp(tk.Tk):
                         if rect.right <= rect.left or rect.bottom <= rect.top:
                             continue
                         exact_rank = 0 if normalized == target else 1
-                        candidates.append((exact_rank, abs(len(normalized) - len(target)),
+                        center_distance = 0
+                        if expected_center:
+                            center_x = (rect.left + rect.right) / 2
+                            center_y = (rect.top + rect.bottom) / 2
+                            center_distance = (
+                                (center_x / max(1, user32.GetSystemMetrics(0)) - expected_center[0]) ** 2
+                                + (center_y / max(1, user32.GetSystemMetrics(1)) - expected_center[1]) ** 2
+                            )
+                        candidates.append((center_distance, exact_rank,
+                                           abs(len(normalized) - len(target)),
                                            rect.left, rect.top, rect.right, rect.bottom))
                     except Exception:
                         continue
@@ -1071,7 +1165,7 @@ class SaathiApp(tk.Tk):
         if not candidates:
             return None
         candidate = min(candidates)
-        return candidate[2], candidate[3], candidate[4], candidate[5]
+        return candidate[3], candidate[4], candidate[5], candidate[6]
 
     def _locate_visible_control(self, image_data, image_size, target_label):
         prompt = (
@@ -1226,6 +1320,10 @@ class SaathiApp(tk.Tk):
                                         arrowshape=(18, 22, 9))
         self.overlay.deiconify()
         self.overlay.lift()
+        # Keep the outline above the Windows taskbar while leaving mouse input
+        # transparent so the highlighted app still receives the click.
+        user32.SetWindowPos(self.overlay_hwnd, wintypes.HWND(-1), 0, 0, 0, 0,
+                            0x0001 | 0x0002 | 0x0010 | 0x0040)
 
     def _hide_overlay(self):
         self.screen_highlight_bounds = None
