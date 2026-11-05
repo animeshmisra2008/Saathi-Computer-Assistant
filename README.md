@@ -8,11 +8,16 @@ Saathi is a voice-first Windows guide for older adults and people who are new to
 
 - **Voice Assistance:** Speak a request and hear each instruction aloud.
 - **Step-by-Step Guidance:** Breaks everyday Windows tasks into one action at a time, with a clear highlighted step.
-- **Screen Guidance:** Select an open app window and Saathi highlights the next button on screen. After each click, it checks the updated window and guides the next action.
+- **Current Official Guidance:** Searches public government and recognized product-support websites, checks their page text and available update dates, and shows the sources used.
+- **Screen Guidance:** Select an open app window and Saathi highlights the next button on screen. It checks after clicks and major screen changes, then adapts the next action to what is visible.
 - **Type Instead:** Hold the edge launcher to type a request.
 - **Language Choice:** Guidance is available in English, Hindi, Bengali, Tamil, Telugu, Kannada, Malayalam, Marathi, Gujarati, Punjabi, and Odia.
 
-Screen guidance sends an image of the selected window to Sarvam when guidance starts and after clicks. Saathi does not save the screenshots or continuously record the screen.
+Saathi sends the user's request to Sarvam to prepare guidance and to DuckDuckGo to find public sources. It reads matching public pages from government sites and recognized product-support sites, and shows the pages it used with available update dates. Screen guidance checks a tiny screen fingerprint locally every 900 ms. It sends a screenshot of the screen to Sarvam when guidance starts, after clicks, and after a major visual change. Saathi does not save screenshots or send the local screen fingerprints.
+
+## Debug Log
+
+Saathi keeps a rotating local log at `%LOCALAPPDATA%\Saathi\logs\saathi-debug.log`. It records task requests, source lookups, concise model evidence notes and decisions, screen checks, highlighted coordinates, spoken directions, and errors. These are short evidence notes, not hidden chain-of-thought. API keys, audio, and screenshot images are never written to the log; common ID, phone, and verification-code number patterns are masked. Right-click the Saathi launcher and choose **Open debug log** to view it.
 
 ## Tech Stack  
 
