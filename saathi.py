@@ -1577,6 +1577,7 @@ class SaathiApp(tk.Tk):
         """Save what the user actually sees, including Saathi's drawn highlight."""
         try:
             image = ImageGrab.grab()
+            captured_size = image.size
             image.thumbnail((1280, 1280))
             memory_file = io.BytesIO()
             image.save(memory_file, format="JPEG", quality=75, optimize=True)
@@ -1584,7 +1585,8 @@ class SaathiApp(tk.Tk):
             screenshot_path = SCREENSHOT_DIR / f"screen-{check_id}-display.jpg"
             screenshot_path.write_bytes(memory_file.getvalue())
             debug_log("screen_display_captured", check_id=check_id,
-                      screenshot_path=str(screenshot_path), includes_overlay=bool(
+                      screenshot_path=str(screenshot_path), size=captured_size,
+                      includes_overlay=bool(
                           self.overlay and self.overlay.winfo_exists() and self.overlay.winfo_viewable()))
             self._prune_debug_screenshots()
         except Exception as exc:
@@ -1649,26 +1651,20 @@ class SaathiApp(tk.Tk):
             f"Current plan step: {step_index + 1} of {len(steps)} — {current_step['heading']}: {current_step['instruction']}\n"
             f"Current image size: {image_size[0]} by {image_size[1]} pixels.\n"
         )
-        if previous_image:
-            prompt += "The first image is the previous screen; the last image is current.\n"
-            if previous_rect:
-                prompt += (f"Previous screen area (left, top, right, bottom): {tuple(round(v) for v in previous_rect)}.\n")
         if click_point:
             prompt += f"The user just clicked at normalized location {click_point} on the previous image.\n"
         if clicked_target:
             prompt += "The click was inside the target you highlighted. Check the new image to confirm the action succeeded, then continue to the next step if it did.\n"
         debug_log("vision_request", check_id=check_id, task=self.task,
                   prompt=prompt, model="gemma4", image_size=image_size,
-                  has_previous_image=bool(previous_image), clicked_target=clicked_target)
+                  has_previous_image=False, clicked_target=clicked_target)
         content = [{"type": "text", "text": prompt}]
-        if previous_image:
-            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{previous_image}"}})
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{current_image}"}})
         response = self.client.chat.completions_v2(
             model="gemma4",
             messages=[{"role": "user", "content": content}],
             temperature=0.2,
-            max_tokens=350,
+            max_tokens=220,
             request_options={"timeout_in_seconds": 30, "max_retries": 0},
         )
         text = response.choices[0].message.content.strip()
@@ -1689,10 +1685,24 @@ class SaathiApp(tk.Tk):
                   target_box=result["target_box"], step_done=result["step_done"],
                   task_done=result["task_done"], clicked_target=clicked_target,
                   image_size=image_size)
-        direct_target = self._browser_navigation_target(image_size)
-        if direct_target:
-            result.update(direct_target)
         address_label = result["target_label"].casefold()
+        is_browser_address_field = (
+            "address" in address_label
+            or "search with google" in address_label
+        )
+        direct_target = self._browser_navigation_target(image_size)
+        # The screenshot is authoritative when it already identifies the
+        # browser's address field. A stale Windows foreground handle can
+        # otherwise replace that with a misleading taskbar instruction.
+        if direct_target and not is_browser_address_field:
+            result.update(direct_target)
+        elif direct_target and is_browser_address_field:
+            browser_window = direct_target.get("_guided_window")
+            if browser_window:
+                self.guided_hwnd, self.guided_process_id, self.guided_window_title = browser_window
+            debug_log("browser_taskbar_override_skipped",
+                      reason="screenshot_identified_address_bar",
+                      target=result["target_label"])
         if (self.browser_search_submitted
                 and ("address" in address_label or "search with google" in address_label)):
             result.update({
@@ -1706,11 +1716,11 @@ class SaathiApp(tk.Tk):
             query = self._browser_search_text()
             if query:
                 result["instruction"] = (
-                    "Type the official guide address shown on the overlay, then press Enter."
+                    "Type the Google search words shown on the overlay, then press Enter."
                     if self.browser_address_clicked else
-                    "Click the address bar. I’ll show you the official guide to open."
+                    "Click the address bar. I’ll show you what to search for."
                 )
-                result["_overlay_text"] = f"Open official guide: {query}"
+                result["_overlay_text"] = f"Google search: {query}"
                 result["_overlay_label"] = "Address bar"
             else:
                 result.update({
@@ -1724,10 +1734,6 @@ class SaathiApp(tk.Tk):
                     "_overlay_label": "",
                 })
         label_for_lookup = result["target_label"].casefold()
-        is_browser_address_field = (
-            "address" in label_for_lookup
-            or "search with google or enter address" in label_for_lookup
-        )
         if result["target_box"] and result["target_label"] and not is_browser_address_field:
             accessible_bounds = self._locate_accessible_control(
                 result["target_label"], expected_box=result["target_box"])
@@ -1745,21 +1751,134 @@ class SaathiApp(tk.Tk):
             # Only draw an arrow when Windows confirms the named control.
             # A second visual guess can confidently point at a different item.
             result["target_box"] = located_box
-        elif is_browser_address_field:
-            # Browser UI Automation often reports the new-tab page's central
-            # search field under the same name as the toolbar URL field. Keep
-            # the box grounded in the current screenshot for this control.
-            debug_log("accessible_lookup_skipped", reason="ambiguous_browser_address_field",
-                      target=result["target_label"], box=result["target_box"])
+        elif is_browser_address_field and result["target_box"]:
+            # Browser toolbars and new-tab search boxes can share an accessible
+            # name. Resolve the toolbar by its position and width, then use its
+            # actual Windows rectangle instead of a model-estimated coordinate.
+            address_bounds = self._locate_browser_address_bar()
+            if address_bounds:
+                screen_width = max(1, user32.GetSystemMetrics(0))
+                screen_height = max(1, user32.GetSystemMetrics(1))
+                result["target_box"] = [
+                    round(address_bounds[0] * 1000 / screen_width),
+                    round(address_bounds[1] * 1000 / screen_height),
+                    round(address_bounds[2] * 1000 / screen_width),
+                    round(address_bounds[3] * 1000 / screen_height),
+                ]
+                debug_log("browser_address_bar_resolved", bounds=address_bounds,
+                          normalized_box=result["target_box"])
+            else:
+                # Some Firefox configurations do not expose the toolbar to
+                # UI Automation. Retain the screenshot-grounded model box as
+                # a fallback instead of dropping the instruction entirely.
+                debug_log("browser_address_bar_not_resolved",
+                          fallback_box=result.get("target_box"),
+                          selected_browser_hwnd=int(self.guided_hwnd or 0))
         return result
+
+    def _locate_browser_address_bar(self):
+        """Find the wide address field in the selected browser's top toolbar."""
+        requested_process = self._requested_browser_process(self.task)
+        browser_info = (self._find_running_window_by_process(requested_process)
+                        if requested_process else None)
+        browser_hwnd = int(browser_info[0]) if browser_info else 0
+        if not browser_hwnd:
+            browser_hwnd = int(user32.GetForegroundWindow() or 0)
+        browser_rect = self._window_rect(browser_hwnd)
+        if not browser_rect:
+            return None
+        window_left, window_top, window_right, window_bottom = browser_rect
+        window_width = max(1, window_right - window_left)
+        window_height = max(1, window_bottom - window_top)
+        try:
+            desktop = Desktop(backend="uia")
+            windows = desktop.windows()
+        except Exception:
+            return None
+        candidates = []
+        address_phrases = (
+            "search with google or enter address", "search or enter address",
+            "search or enter website name", "address and search bar", "address bar",
+        )
+        for window in windows:
+            try:
+                if int(window.handle) != browser_hwnd:
+                    continue
+                for element in window.descendants():
+                    try:
+                        name = element.window_text().strip().casefold()
+                        control_type = element.element_info.control_type
+                        if control_type not in {"Edit", "ComboBox", "Custom"}:
+                            continue
+                        if not any(phrase in name for phrase in address_phrases):
+                            continue
+                        if not element.is_visible() or not element.is_enabled():
+                            continue
+                        rect = element.rectangle()
+                        width = rect.right - rect.left
+                        height = rect.bottom - rect.top
+                        if width < window_width * 0.35 or height < 12:
+                            continue
+                        if (rect.top < window_top - 4
+                                or rect.top > window_top + window_height * 0.25):
+                            continue
+                        # Favor the highest wide matching field. The new-tab
+                        # page's centered search box is far below this region.
+                        candidates.append((rect.top, -width, rect.left, rect.bottom,
+                                           rect.right))
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        if not candidates:
+            # Firefox exposes its toolbar as one Navigation group and labels
+            # the URL field as a Document Button, rather than an Edit control.
+            # Derive the address-field span between the search-engine selector
+            # and the right-side toolbar buttons.
+            for window in windows:
+                try:
+                    if int(window.handle) != browser_hwnd:
+                        continue
+                    navigation = next((item for item in window.descendants()
+                                       if item.element_info.control_type == "ToolBar"
+                                       and item.window_text().strip().casefold() == "navigation"), None)
+                    if not navigation:
+                        continue
+                    nav = navigation.rectangle()
+                    controls = []
+                    for item in navigation.descendants():
+                        try:
+                            if item.element_info.control_type not in {"Button", "ComboBox"}:
+                                continue
+                            rect = item.rectangle()
+                            if rect.right > rect.left and rect.bottom > rect.top:
+                                controls.append((item.window_text().strip().casefold(), rect))
+                        except Exception:
+                            continue
+                    left_controls = [r.right for name, r in controls
+                                     if any(word in name for word in ("search engine", "reload"))]
+                    right_controls = [r.left for name, r in controls
+                                      if any(word in name for word in ("extension", "bookmark", "firefox"))
+                                      and r.left > nav.left + (nav.right-nav.left) * 0.55]
+                    if left_controls and right_controls:
+                        left = min(max(left_controls) + 8, nav.right)
+                        right = max(left, min(right_controls) - 8)
+                        bounds = (left, nav.top + 7, right, nav.bottom - 7)
+                        debug_log("browser_address_bar_from_navigation_toolbar", bounds=bounds)
+                        return bounds
+                except Exception:
+                    continue
+            return None
+        top, neg_width, left, bottom, right = min(candidates)
+        return (left, top, right, bottom)
 
     def _browser_navigation_target(self, image_size):
         """Ground browser tasks in the requested app process and taskbar button."""
         goal = (self.task or "").casefold()
-        wants_youtube = "youtube" in goal
-        is_web_search = wants_youtube or any(
-            word in goal for word in ("search", "look up", "find online", "website", "google")
-        )
+        is_web_search = bool(self.task_sources) or bool(re.search(
+            r"\b(search|look up|find online|website|google|browser|internet|online|visit|browse)\b",
+            goal,
+        ))
         requested_process = self._requested_browser_process(self.task)
         if not requested_process and not is_web_search:
             return None
@@ -1817,96 +1936,30 @@ class SaathiApp(tk.Tk):
                             }
                 return None
 
-            if wants_youtube and "youtube" in browser_title.casefold():
-                return {
-                    "instruction": "YouTube is open in Firefox.",
-                    "target_label": "",
-                    "target_box": None,
-                    "step_done": True,
-                    "task_done": True,
-                    "_guided_window": browser_info,
-                }
-
-            if wants_youtube:
-                for element in browser.descendants():
-                    if (element.element_info.control_type == "Hyperlink"
-                            and "youtube" in element.window_text().casefold()
-                            and element.is_visible() and element.is_enabled()):
-                        return {
-                            "instruction": "Click the YouTube shortcut on Firefox's new tab page.",
-                            "target_label": element.window_text().strip(),
-                            "target_box": normalized_box(element.rectangle()),
-                            "step_done": False,
-                            "task_done": False,
-                            "_guided_window": browser_info,
-                        }
-
-            if not wants_youtube:
-                return None
-
-            if self.browser_search_submitted:
-                return None
-
-            for element in browser.descendants():
-                name = element.window_text().strip()
-                if (element.element_info.control_type not in {"Button", "Edit", "ComboBox"}
-                        or "search with google or enter address" not in name.casefold()
-                        or not element.is_visible() or not element.is_enabled()):
-                    continue
-                search_text = self._browser_search_text()
-                if not search_text:
-                    return {
-                        "instruction": (
-                            "I couldn't retrieve a reliable guide for the next step, "
-                            "so I won't put your request into the address bar."
-                        ),
-                        "target_label": "",
-                        "target_box": None,
-                        "step_done": False,
-                        "task_done": False,
-                        "_guided_window": browser_info,
-                    }
-                instruction = (
-                    "Type the official website address shown on the overlay, then press Enter."
-                    if self.browser_address_clicked else
-                    "Click the address bar. I’ll show you the official guide to open."
-                )
-                return {
-                    "instruction": instruction,
-                    "target_label": name,
-                    "target_box": normalized_box(element.rectangle()),
-                    "step_done": False,
-                    "task_done": False,
-                    "_guided_window": browser_info,
-                    "_overlay_text": f"Open official guide: {search_text}",
-                    "_overlay_label": "Address bar",
-                }
+            # Once the requested browser is in front, let screen understanding
+            # identify the next control. If it identifies the address field,
+            # _locate_browser_address_bar replaces the guessed box with the
+            # actual toolbar rectangle.
         except Exception:
             return None
         return None
 
     def _browser_search_text(self):
-        """Return a planned reputable destination or guide URL, never the whole request."""
-        for step in self.steps or []:
-            instruction = str(step.get("instruction", ""))
-            for match in re.finditer(
-                    r"(?i)(?:https?://)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+"
-                    r"[a-z]{2,}(?:/[^\s\"'<>)]*)?", instruction):
-                candidate = match.group(0).rstrip(".,;:!?]")
-                if not candidate.casefold().startswith(("http://", "https://")):
-                    candidate = "https://" + candidate
-                url = self._public_https_url(candidate)
-                if url and self._is_reputable_guide_host(urlparse(url).hostname or ""):
-                    debug_log("browser_destination_selected", destination=url,
-                              basis="source_grounded_plan")
-                    return url
-        for source in self.task_sources or []:
-            url = self._public_https_url(source.get("url", ""))
-            if url and self._is_reputable_guide_host(urlparse(url).hostname or ""):
-                debug_log("browser_destination_selected", destination=url,
-                          basis="retrieved_reference")
-                return url
-        return ""
+        """Turn the user's goal into a readable search phrase, not a URL."""
+        query = re.sub(r"\s+", " ", str(self.task or "")).strip(" \t\r\n.,!?;:")
+        for browser, (_, *aliases) in BROWSER_PROCESSES.items():
+            for alias in (browser, *aliases):
+                query = re.sub(
+                    rf"(?i)\b(?:through|using|with|in|on)\s+{re.escape(alias)}\b", "", query)
+                query = re.sub(rf"(?i)\b{re.escape(alias)}\b", "", query)
+        query = re.sub(r"(?i)^(?:please\s+)?(?:can you help me|could you help me|help me|show me how to|how do I|how can I|I want to|I need to)\s+", "", query)
+        query = re.sub(r"\s+", " ", query).strip(" \t\r\n.,!?;:")
+        if not query:
+            return ""
+        if not re.match(r"(?i)^how\s+to\b", query):
+            query = "how to " + query
+        debug_log("browser_search_phrase_selected", query=query, basis="user_goal")
+        return query
 
     @staticmethod
     def _locate_accessible_control(target_label, expected_box=None):
@@ -2045,7 +2098,9 @@ class SaathiApp(tk.Tk):
         self.screen_highlight_bounds = (api_x1, api_y1, api_x2, api_y2)
         debug_log("overlay_shown", target=self.screen_target_label,
                   screen_bounds=self.screen_highlight_bounds,
-                  guidance=self.screen_instruction)
+                  guidance=self.screen_instruction,
+                  image_target_box=box, capture_rect=capture_rect,
+                  tk_scale=self.screen_api_scale)
         api_scale_x, api_scale_y = self.screen_api_scale
         x1, y1 = round(api_x1 / api_scale_x), round(api_y1 / api_scale_y)
         x2, y2 = round(api_x2 / api_scale_x), round(api_y2 / api_scale_y)
@@ -2093,51 +2148,45 @@ class SaathiApp(tk.Tk):
                                            ctypes.c_void_p).value)
             user32.SetWindowPos(hwnd, None, 0, 0, 0, 0,
                                 0x0001 | 0x0002 | 0x0004 | 0x0020)
-        margin = 30
+        margin = 8
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
         overlay_x = max(0, min(x1 - margin, screen_width - 1))
-        overlay_y = max(0, min(y1 - margin, screen_height - 1))
+        overlay_y = max(0, min(y1 - 34, screen_height - 1))
+        cue_height = (min(108, max(56, 24 + ((len(self.screen_overlay_text) + 47) // 48) * 18))
+                      if self.screen_overlay_text else 0)
         box_width = max(110, min(screen_width - overlay_x, x2 - x1 + 2 * margin))
-        cue_height = 62 if self.screen_overlay_text else 0
-        box_height = max(90, min(screen_height - overlay_y,
-                                 y2 - y1 + 2 * margin + cue_height))
+        box_height = max(72, min(screen_height - overlay_y,
+                                 y2 - y1 + (y1 - overlay_y) + cue_height + 8))
         target_left, target_top = x1 - overlay_x, y1 - overlay_y
         target_right, target_bottom = x2 - overlay_x, y2 - overlay_y
         self.overlay.geometry(f"{box_width}x{box_height}+{overlay_x}+{overlay_y}")
         self.overlay_canvas.configure(width=box_width, height=box_height)
         self.overlay_canvas.delete("all")
         self.overlay_canvas.create_rectangle(target_left, target_top, target_right, target_bottom,
-                                             outline="white", width=11)
-        self.overlay_canvas.create_rectangle(target_left, target_top, target_right, target_bottom,
-                                             outline="#FF4B00", width=7)
-        label_x = max(58, min(box_width - 58, (target_left + target_right) / 2))
-        label_y = max(18, target_top - 16)
+                                             outline="#FF5A1F", width=3)
+        label_x = max(54, min(box_width - 54, target_left + 56))
+        label_y = max(14, target_top - 18)
         label_text = (self.screen_target_label or "CLICK HERE")[:14]
-        label_half_width = max(54, len(label_text) * 5 + 14)
+        label_half_width = max(42, len(label_text) * 4 + 10)
         label_x = max(label_half_width + 4,
-                      min(box_width - label_half_width - 4, (target_left + target_right) / 2))
-        self.overlay_canvas.create_rectangle(label_x - label_half_width, label_y - 14,
+                      min(box_width - label_half_width - 4, target_left + label_half_width))
+        self.overlay_canvas.create_rectangle(label_x - label_half_width, label_y - 11,
                                              label_x + label_half_width,
-                                             label_y + 14, fill="#FF4B00", outline="white", width=2)
+                                             label_y + 11, fill="#FF5A1F", outline="")
         self.overlay_canvas.create_text(label_x, label_y, text=label_text, fill="white",
-                                        font=("Segoe UI", 11, "bold"))
-        start_y = label_y + 15
-        end_y = max(target_top, min(target_bottom, start_y + 26))
-        self.overlay_canvas.create_line(label_x, start_y, (target_left + target_right) / 2,
-                                        end_y, fill="#FF4B00", width=7, arrow="last",
-                                        arrowshape=(18, 22, 9))
+                                        font=("Segoe UI", 9, "bold"))
         if self.screen_overlay_text:
-            cue_width = max(170, min(560, box_width - target_left - 8))
+            cue_width = min(420, box_width - 8)
             cue_x = max(4, target_left)
-            cue_y = min(box_height - cue_height - 4, target_bottom + 10)
+            cue_y = min(box_height - cue_height - 4, target_bottom + 8)
             self.overlay_canvas.create_rectangle(
                 cue_x, cue_y, cue_x + cue_width, cue_y + cue_height,
-                fill="#18304B", outline="white", width=2)
+                fill="#18304B", outline="")
             self.overlay_canvas.create_text(
-                cue_x + 10, cue_y + 8, text=self.screen_overlay_text,
-                fill="white", font=("Segoe UI", 11, "bold"),
-                width=cue_width - 20, anchor="nw", justify="left")
+                cue_x + 12, cue_y + 9, text=self.screen_overlay_text,
+                fill="white", font=("Segoe UI", 10, "bold"),
+                width=cue_width - 24, anchor="nw", justify="left")
         self.overlay.deiconify()
         self.overlay.lift()
         # Keep the outline above the Windows taskbar while leaving mouse input
@@ -2151,6 +2200,9 @@ class SaathiApp(tk.Tk):
         user32.SetWindowPos(self.overlay_hwnd, wintypes.HWND(-1),
                             native_x, native_y, native_width, native_height,
                             0x0010 | 0x0040)
+        debug_log("overlay_native_geometry", x=native_x, y=native_y,
+                  width=native_width, height=native_height,
+                  screen_size=(user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)))
 
     def _hide_overlay(self):
         if self.overlay and self.overlay.winfo_exists() and self.overlay.winfo_viewable():
