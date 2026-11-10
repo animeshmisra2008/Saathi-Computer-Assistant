@@ -190,6 +190,8 @@ kernel32.CloseHandle.restype = wintypes.BOOL
 
 SYSTEM_PROMPT = """You are Saathi, a patient guide for people who are new to Windows 11.
 Explain the requested computer task as 3 to 7 small, safe steps in the selected language.
+For tasks that use a website, teach the user to search for the service or organization in the browser and choose its official result. Do not ask them to type a URL. Once search results appear, guide them to the relevant official result and continue from the page they open.
+For search_phrase, write only a concise service/organization name and broad action (for example, "apply for passport"). Exclude conversational wording, procedural qualifiers, age, personal circumstances, account details, and other context about the user. Prefer the official organization's main website as the starting point; the screen guide will help navigate after it opens.
 Use short, familiar words. Give exactly one action per step. Name visible buttons and
 menus when you can. Never claim you can see the user's screen. If an exact label may
 vary, say what to look for. If the request is ambiguous, make the first step a simple
@@ -197,7 +199,7 @@ question. Do not ask for or guide entry of passwords, PINs, one-time codes, bank
 details, or remote access. Do not suggest deleting files, installing unknown software,
 or changing security settings.
 Return only valid JSON in this shape:
-{"title":"short task name","basis_note":"brief source/evidence note, not private reasoning","steps":[{"heading":"short action","instruction":"one clear action"}]}"""
+{"title":"short task name","search_phrase":"short service/action search, no personal context","basis_note":"brief source/evidence note, not private reasoning","steps":[{"heading":"short action","instruction":"one clear action"}]}"""
 
 
 class _SearchResultsParser(HTMLParser):
@@ -366,6 +368,7 @@ class SaathiApp(tk.Tk):
         self.screen_overlay_text = ""
         self.browser_address_clicked = False
         self.browser_search_submitted = False
+        self.browser_search_phrase = ""
         self.enter_was_down = False
         self.screen_previous_image = None
         self.screen_previous_rect = None
@@ -716,15 +719,15 @@ class SaathiApp(tk.Tk):
             preview = transcript if len(transcript) <= 100 else transcript[:97] + "…"
             self.after(0, lambda: self._set_voice_progress(
                 f'I heard: “{preview}”\nPreparing clear steps…'))
-            title, steps, sources = self._make_steps(transcript, response_language)
-            return title, steps, sources, transcript, detected
+            title, steps, sources, search_phrase = self._make_steps(transcript, response_language)
+            return title, steps, sources, search_phrase, transcript, detected
 
         def complete(result):
             Path(path).unlink(missing_ok=True)
-            title, steps, sources, transcript, detected = result
+            title, steps, sources, search_phrase, transcript, detected = result
             if detected in LANGUAGE_BY_CODE:
                 self.language_var.set(LANGUAGE_BY_CODE[detected])
-            self._show_steps(title, steps, transcript, sources)
+            self._show_steps(title, steps, transcript, sources, search_phrase)
 
         def failed(exc):
             Path(path).unlink(missing_ok=True)
@@ -744,7 +747,7 @@ class SaathiApp(tk.Tk):
         self._set_status("Preparing your steps…")
         self._run_background(
             lambda: self._make_steps(task, self.language_var.get()),
-            lambda result: self._show_steps(result[0], result[1], task, result[2]),
+            lambda result: self._show_steps(result[0], result[1], task, result[2], result[3]),
             self._task_failed,
         )
 
@@ -959,7 +962,9 @@ class SaathiApp(tk.Tk):
             {"title": source["title"], "url": source["url"], "updated": source["updated"]}
             for source in sources
         ]
-        return str(data.get("title") or task), clean_steps, public_sources
+        search_phrase = str(data.get("search_phrase") or "").strip()
+        debug_log("planner_search_phrase", search_phrase=search_phrase)
+        return str(data.get("title") or task), clean_steps, public_sources, search_phrase
 
     def _run_background(self, action, on_success, on_error):
         if self.busy:
@@ -995,11 +1000,12 @@ class SaathiApp(tk.Tk):
         self._show_home("type")
         self._set_status(self._friendly_error(error))
 
-    def _show_steps(self, title, steps, task, sources=None):
+    def _show_steps(self, title, steps, task, sources=None, search_phrase=""):
         self.task = task
         self.task_title = title
         self.steps = steps
         self.task_sources = sources or []
+        self.browser_search_phrase = search_phrase
         self.step_index = 0
         self.help_text = ""
         self._render_step()
@@ -1649,7 +1655,9 @@ class SaathiApp(tk.Tk):
             f"Write the instruction in {language_name} ({language_code}).\n\n"
             f"User's goal: {self.task}\nPlan:\n{plan}\n"
             f"Current plan step: {step_index + 1} of {len(steps)} — {current_step['heading']}: {current_step['instruction']}\n"
-            f"Current image size: {image_size[0]} by {image_size[1]} pixels.\n"
+            + ("The user has already submitted the Google search. Do not ask them to enter any URL, search again, or return to the address bar. Inspect the visible results and guide them to the best matching official organization homepage/result; if it is not clear, ask them to choose a result whose name matches the organization.\n"
+               if self.browser_search_submitted else "")
+            + f"Current image size: {image_size[0]} by {image_size[1]} pixels.\n"
         )
         if click_point:
             prompt += f"The user just clicked at normalized location {click_point} on the previous image.\n"
@@ -1703,16 +1711,12 @@ class SaathiApp(tk.Tk):
             debug_log("browser_taskbar_override_skipped",
                       reason="screenshot_identified_address_bar",
                       target=result["target_label"])
-        if (self.browser_search_submitted
+        if (not self.browser_search_submitted
                 and ("address" in address_label or "search with google" in address_label)):
-            result.update({
-                "instruction": "The guide page is open. I’m checking what it shows now.",
-                "target_label": "",
-                "target_box": None,
-                "_overlay_text": "",
-            })
-        elif (not self.browser_search_submitted
-              and ("address" in address_label or "search with google" in address_label)):
+            # Focusing the address field is not completion; only Enter submits
+            # the search. Prevent the planner's following URL step from taking
+            # over before the user has seen the results.
+            result["step_done"] = False
             query = self._browser_search_text()
             if query:
                 result["instruction"] = (
@@ -1945,21 +1949,8 @@ class SaathiApp(tk.Tk):
         return None
 
     def _browser_search_text(self):
-        """Turn the user's goal into a readable search phrase, not a URL."""
-        query = re.sub(r"\s+", " ", str(self.task or "")).strip(" \t\r\n.,!?;:")
-        for browser, (_, *aliases) in BROWSER_PROCESSES.items():
-            for alias in (browser, *aliases):
-                query = re.sub(
-                    rf"(?i)\b(?:through|using|with|in|on)\s+{re.escape(alias)}\b", "", query)
-                query = re.sub(rf"(?i)\b{re.escape(alias)}\b", "", query)
-        query = re.sub(r"(?i)^(?:please\s+)?(?:can you help me|could you help me|help me|show me how to|how do I|how can I|I want to|I need to)\s+", "", query)
-        query = re.sub(r"\s+", " ", query).strip(" \t\r\n.,!?;:")
-        if not query:
-            return ""
-        if not re.match(r"(?i)^how\s+to\b", query):
-            query = "how to " + query
-        debug_log("browser_search_phrase_selected", query=query, basis="user_goal")
-        return query
+        """Return the concise search phrase chosen by the task planner."""
+        return self.browser_search_phrase
 
     @staticmethod
     def _locate_accessible_control(target_label, expected_box=None):
@@ -2153,7 +2144,7 @@ class SaathiApp(tk.Tk):
         screen_height = self.winfo_screenheight()
         overlay_x = max(0, min(x1 - margin, screen_width - 1))
         overlay_y = max(0, min(y1 - 34, screen_height - 1))
-        cue_height = (min(108, max(56, 24 + ((len(self.screen_overlay_text) + 47) // 48) * 18))
+        cue_height = (min(180, max(84, 40 + ((len(self.screen_overlay_text) + 55) // 56) * 26))
                       if self.screen_overlay_text else 0)
         box_width = max(110, min(screen_width - overlay_x, x2 - x1 + 2 * margin))
         box_height = max(72, min(screen_height - overlay_y,
@@ -2177,7 +2168,7 @@ class SaathiApp(tk.Tk):
         self.overlay_canvas.create_text(label_x, label_y, text=label_text, fill="white",
                                         font=("Segoe UI", 9, "bold"))
         if self.screen_overlay_text:
-            cue_width = min(420, box_width - 8)
+            cue_width = min(560, box_width - 8)
             cue_x = max(4, target_left)
             cue_y = min(box_height - cue_height - 4, target_bottom + 8)
             self.overlay_canvas.create_rectangle(
